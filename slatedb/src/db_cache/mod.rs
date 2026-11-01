@@ -604,14 +604,14 @@ impl DbCache for SplitCache {
         match &value.item {
             CachedItem::Block(_) => {
                 if let Some(ref cache) = self.block_cache {
-                    cache.insert(key, value.clamp_allocated_size()).await;
+                    cache.insert(key, value).await;
                 } else {
                     trace!("no block cache available for insertion");
                 }
             }
             CachedItem::SsTableIndex(_) | CachedItem::Filters(_) | CachedItem::SstStats(_) => {
                 if let Some(ref cache) = self.meta_cache {
-                    cache.insert(key, value.clamp_allocated_size()).await;
+                    cache.insert(key, value).await;
                 } else {
                     trace!("no meta cache available for insertion");
                 }
@@ -732,6 +732,10 @@ impl DbCache for SplitCache {
 /// not derived by SlateDB: pass the same id across a legitimate reopen of the same
 /// logical database to recover its warm entries, and different ids for logically
 /// different databases sharing the cache.
+///
+/// This wrapper clamps every entry before the inner cache stores it. A built block can keep a
+/// buffer much larger than its data, and a cache that weighs entries by [`CachedEntry::size`]
+/// does not see the extra memory.
 pub(crate) struct DbCacheWrapper {
     stats: DbCacheStats,
     system_clock: Arc<dyn SystemClock>,
@@ -909,7 +913,9 @@ impl DbCache for DbCacheWrapper {
 
     async fn insert(&self, key: CachedKey, value: CachedEntry) {
         let scoped_key = self.scoped_key(&key);
-        self.cache.insert(scoped_key, value).await;
+        self.cache
+            .insert(scoped_key, value.clamp_allocated_size())
+            .await;
     }
 
     #[allow(dead_code)]
@@ -936,7 +942,10 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         let scoped_key = self.scoped_key(&key);
-        let result = self.cache.fetch_block(scoped_key, loader).await;
+        let result = self
+            .cache
+            .fetch_block(scoped_key, clamping_loader(loader))
+            .await;
         self.record_fetch_outcome("block", &result);
         result
     }
@@ -947,7 +956,10 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         let scoped_key = self.scoped_key(&key);
-        let result = self.cache.fetch_index(scoped_key, loader).await;
+        let result = self
+            .cache
+            .fetch_index(scoped_key, clamping_loader(loader))
+            .await;
         self.record_fetch_outcome("index", &result);
         result
     }
@@ -958,7 +970,10 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         let scoped_key = self.scoped_key(&key);
-        let result = self.cache.fetch_filter(scoped_key, loader).await;
+        let result = self
+            .cache
+            .fetch_filter(scoped_key, clamping_loader(loader))
+            .await;
         self.record_fetch_outcome("filter", &result);
         result
     }
@@ -969,7 +984,10 @@ impl DbCache for DbCacheWrapper {
         loader: CacheLoader,
     ) -> Result<CacheFetch, crate::Error> {
         let scoped_key = self.scoped_key(&key);
-        let result = self.cache.fetch_stats(scoped_key, loader).await;
+        let result = self
+            .cache
+            .fetch_stats(scoped_key, clamping_loader(loader))
+            .await;
         self.record_fetch_outcome("stats", &result);
         result
     }
@@ -1069,6 +1087,10 @@ impl DbCache for UnownedDbCache {
     ) -> Result<CacheFetch, crate::Error> {
         self.inner.fetch_stats(key, loader).await
     }
+}
+
+fn clamping_loader(loader: CacheLoader) -> CacheLoader {
+    Box::new(move || Box::pin(async move { Ok(loader().await?.clamp_allocated_size()) }))
 }
 
 /// Tracks whether this caller ran the loader.
@@ -2090,6 +2112,63 @@ mod tests {
     #[fixture]
     async fn sst(sst_format: SsTableFormat) -> EncodedSsTable {
         build_test_sst(&sst_format, 1).await
+    }
+
+    /// Blocks keep the buffer that built them, so every cache must receive a copy on both the
+    /// insert path and the fetch path. A user-provided cache has no clamp of its own.
+    #[tokio::test]
+    async fn test_should_clamp_inserted_and_fetched_blocks_for_any_cache() {
+        use crate::db_cache::{test_utils::TestCache, CacheLoader, UnownedDbCache};
+        use crate::format::block::Block;
+
+        fn build_block() -> Arc<Block> {
+            let mut builder = BlockBuilder::new_latest(4096);
+            assert!(builder
+                .add(RowEntry::new_value(b"key", b"value", 0))
+                .unwrap());
+            Arc::new(builder.build().unwrap())
+        }
+
+        fn assert_clamped(original: &Block, stored: &Block) {
+            assert_eq!(original.data, stored.data);
+            assert_eq!(original.offsets, stored.offsets);
+            assert_ne!(original.data.as_ptr(), stored.data.as_ptr());
+        }
+
+        let helper = MetricsRecorderHelper::new(
+            Arc::new(DefaultMetricsRecorder::new()),
+            MetricLevel::default(),
+        );
+        let wrapper = DbCacheWrapper::new(
+            Arc::new(UnownedDbCache::new(Arc::new(TestCache::new()))),
+            &helper,
+            Arc::new(DefaultSystemClock::default()),
+            1,
+        );
+
+        let inserted = build_block();
+        let insert_key = CachedKey::from((SST_ID, 1u64));
+        wrapper
+            .insert(
+                insert_key.clone(),
+                CachedEntry::with_block(inserted.clone()),
+            )
+            .await;
+        let stored = wrapper.get_block(&insert_key).await.unwrap().unwrap();
+        assert_clamped(&inserted, &stored.block().unwrap());
+
+        let loaded = build_block();
+        let loader_block = loaded.clone();
+        let loader: CacheLoader =
+            Box::new(move || Box::pin(async move { Ok(CachedEntry::with_block(loader_block)) }));
+        let fetch_key = CachedKey::from((SST_ID, 2u64));
+        let fetched = wrapper
+            .fetch_block(fetch_key.clone(), loader)
+            .await
+            .unwrap();
+        assert_clamped(&loaded, &fetched.entry.block().unwrap());
+        let stored = wrapper.get_block(&fetch_key).await.unwrap().unwrap();
+        assert_clamped(&loaded, &stored.block().unwrap());
     }
 
     /// Canary for `UnownedDbCache`'s delegation: every defaulted trait method must be
