@@ -1554,10 +1554,15 @@ impl From<FbCompactionStatus> for CompactionStatus {
 #[cfg(test)]
 pub(crate) mod test_utils {
     use crate::flatbuffer_types::SsTableIndexOwned;
+    use bytes::Bytes;
 
     pub(crate) fn assert_index_clamped(index1: &SsTableIndexOwned, index2: &SsTableIndexOwned) {
         assert_eq!(index1.data, index2.data);
         assert_ne!(index1.data.as_ptr(), index2.data.as_ptr());
+    }
+
+    pub(crate) fn index_data(index: SsTableIndexOwned) -> Bytes {
+        index.data
     }
 }
 

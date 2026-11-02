@@ -213,7 +213,7 @@ impl TableStore {
             cache
                 .insert(
                     (sst_table_id, block.offset).into(),
-                    CachedEntry::with_block(Arc::clone(&block.block)),
+                    CachedEntry::with_block(Arc::new(block.block.clamp_allocated_size())),
                 )
                 .await;
         }
@@ -221,7 +221,7 @@ impl TableStore {
             cache
                 .insert(
                     (sst_table_id, encoded_sst.info.index_offset).into(),
-                    CachedEntry::with_sst_index(Arc::new(encoded_sst.index.clone())),
+                    CachedEntry::with_sst_index(Arc::new(encoded_sst.index.clamp_allocated_size())),
                 )
                 .await;
         }
@@ -229,7 +229,7 @@ impl TableStore {
             cache
                 .insert(
                     (sst_table_id, encoded_sst.info.filter_offset).into(),
-                    CachedEntry::with_filters(encoded_sst.filters.clone()),
+                    CachedEntry::with_filters(encoded_sst.filters.clone()).clamp_allocated_size(),
                 )
                 .await;
         }
@@ -276,7 +276,10 @@ impl TableStore {
             .into();
 
         cache
-            .insert(cache_key, CachedEntry::with_filters(decoded.clone()))
+            .insert(
+                cache_key,
+                CachedEntry::with_filters(decoded.clone()).clamp_allocated_size(),
+            )
             .await;
         decoded
     }
@@ -629,7 +632,9 @@ impl TableStore {
                                 .read_filters(&info, &obj)
                                 .await
                                 .map_err(|e| e.with_path(&obj.path))?;
-                            Ok(Some(CachedEntry::with_filters(filters)))
+                            Ok(Some(
+                                CachedEntry::with_filters(filters).clamp_allocated_size(),
+                            ))
                         }
                         CacheTarget::Stats => {
                             let stats = sst_format
@@ -643,7 +648,9 @@ impl TableStore {
                                 .read_index(&info, &obj)
                                 .await
                                 .map_err(|e| e.with_path(&obj.path))?;
-                            Ok(Some(CachedEntry::with_sst_index(Arc::new(index))))
+                            Ok(Some(CachedEntry::with_sst_index(Arc::new(
+                                index.clamp_allocated_size(),
+                            ))))
                         }
                         CacheTarget::Data(_) => {
                             unreachable!("data blocks use block_loader, not read_loader")
@@ -689,7 +696,9 @@ impl TableStore {
                         .map_err(|e| e.with_path(&obj.path))
                 })
                 .await?;
-                Ok(CachedEntry::with_block(Arc::new(block)))
+                Ok(CachedEntry::with_block(Arc::new(
+                    block.clamp_allocated_size(),
+                )))
             })
         })
     }
@@ -954,7 +963,10 @@ impl TableStore {
         if let Some(cache) = self.cache_for_reads() {
             if !blocks_to_cache.is_empty() {
                 join_all(blocks_to_cache.into_iter().map(|(id, offset, block)| {
-                    cache.insert((id, offset).into(), CachedEntry::with_block(block))
+                    cache.insert(
+                        (id, offset).into(),
+                        CachedEntry::with_block(Arc::new(block.clamp_allocated_size())),
+                    )
                 }))
                 .await;
             }
@@ -1296,7 +1308,7 @@ impl EncodedSsTableWriter {
                 cache
                     .insert(
                         (self.id, block.offset).into(),
-                        CachedEntry::with_block(block.block),
+                        CachedEntry::with_block(Arc::new(block.block.clamp_allocated_size())),
                     )
                     .await;
             }
@@ -1346,6 +1358,7 @@ mod tests {
     use crate::db_cache::{CachedKey, DbCache, DbCacheWrapper};
     use crate::db_state::{SsTableHandle, SsTableInfo};
     use crate::error;
+    use crate::flatbuffer_types::test_utils::index_data;
     use crate::flatbuffer_types::{
         BlockMeta, BlockMetaArgs, SsTableIndex, SsTableIndexArgs, SsTableIndexOwned,
     };
@@ -2798,6 +2811,174 @@ mod tests {
             assert!(cached_block.is_some());
             assert!(block == *cached_block.unwrap().block().unwrap());
         }
+    }
+
+    #[tokio::test]
+    async fn test_write_sst_should_clamp_cached_entries() {
+        // given:
+        let cache = Arc::new(TestCache::new());
+        let ts = TableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat::default(),
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let id = SsTableId::from(ulid::Ulid::new());
+        let sst = build_test_sst(&ts.sst_format, 1).await;
+        let block_key: CachedKey = (id, sst.unconsumed_blocks[0].offset).into();
+        let index_key: CachedKey = (id, sst.info.index_offset).into();
+
+        // when:
+        ts.write_sst(&id, &sst, Some(Bytes::new())).await.unwrap();
+
+        // then:
+        assert_cached_block_clamped(&cache, &block_key).await;
+        assert_cached_index_clamped(&cache, &index_key).await;
+    }
+
+    #[tokio::test]
+    async fn test_table_writer_should_clamp_cached_blocks() {
+        // given:
+        let cache = Arc::new(TestCache::new());
+        let ts = Arc::new(TableStore::new(
+            Arc::new(InMemory::new()),
+            SsTableFormat {
+                block_size: 128,
+                ..SsTableFormat::default()
+            },
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        ));
+        let id = SsTableId::from(ulid::Ulid::new());
+
+        // when:
+        let mut writer = ts.table_writer(id, Some(Bytes::new()));
+        for i in 0..8 {
+            writer
+                .add(RowEntry::new_value(&[i; 16], &[i + 1; 16], 0))
+                .await
+                .unwrap();
+        }
+        let (handle, _) = writer.close().await.unwrap();
+
+        // then:
+        let index = ts
+            .read_index(&handle, false, Some(Bytes::new()), &ReadTrace::none(), None)
+            .await
+            .unwrap();
+        let block_metas = index.borrow().block_meta();
+        assert!(block_metas.len() > 1);
+        for i in 0..block_metas.len() {
+            let key: CachedKey = (id, block_metas.get(i).offset()).into();
+            assert_cached_block_clamped(&cache, &key).await;
+        }
+    }
+
+    #[rstest]
+    #[case::fetched_block(0..1)]
+    #[case::inserted_blocks(0..2)]
+    #[tokio::test]
+    async fn test_read_blocks_should_clamp_cached_blocks(#[case] blocks: Range<usize>) {
+        // given:
+        let (reader, cache, handle) = reader_with_cache_and_sst().await;
+        let index = reader
+            .read_index(&handle, false, Some(Bytes::new()), &ReadTrace::none(), None)
+            .await
+            .unwrap();
+
+        // when:
+        reader
+            .read_blocks_using_index(
+                &handle,
+                index.clone(),
+                blocks.clone(),
+                true,
+                Some(Bytes::new()),
+                &ReadTrace::none(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // then:
+        for i in blocks {
+            let key: CachedKey = (handle.id, index.borrow().block_meta().get(i).offset()).into();
+            assert_cached_block_clamped(&cache, &key).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_index_should_clamp_cached_index() {
+        // given:
+        let (reader, cache, handle) = reader_with_cache_and_sst().await;
+
+        // when:
+        reader
+            .read_index(&handle, true, Some(Bytes::new()), &ReadTrace::none(), None)
+            .await
+            .unwrap();
+
+        // then:
+        let key: CachedKey = (handle.id, handle.info.index_offset).into();
+        assert_cached_index_clamped(&cache, &key).await;
+    }
+
+    async fn reader_with_cache_and_sst() -> (TableStore, Arc<TestCache>, SsTableHandle) {
+        let main_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let format = SsTableFormat {
+            block_size: 128,
+            ..SsTableFormat::default()
+        };
+        let writer = TableStore::new(
+            main_store.clone(),
+            format.clone(),
+            Path::from(ROOT),
+            None,
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        let id = SsTableId::from(ulid::Ulid::new());
+        let sst = build_test_sst(&format, 2).await;
+        let handle = writer
+            .write_sst(&id, &sst, Some(Bytes::new()))
+            .await
+            .unwrap();
+        let cache = Arc::new(TestCache::new());
+        let reader = TableStore::new(
+            main_store,
+            format,
+            Path::from(ROOT),
+            Some(cache.clone()),
+            TableStoreKind::Main,
+            BlockCachePolicy::default(),
+        );
+        (reader, cache, handle)
+    }
+
+    async fn assert_cached_block_clamped(cache: &TestCache, key: &CachedKey) {
+        let entry = cache.get_block(key).await.unwrap().unwrap();
+        cache.remove(key).await;
+        let block = entry.block().unwrap();
+        drop(entry);
+        assert_allocation_matches_len(Arc::into_inner(block).unwrap().data);
+    }
+
+    async fn assert_cached_index_clamped(cache: &TestCache, key: &CachedKey) {
+        let entry = cache.get_index(key).await.unwrap().unwrap();
+        cache.remove(key).await;
+        let index = entry.sst_index().unwrap();
+        drop(entry);
+        assert_allocation_matches_len(index_data(Arc::into_inner(index).unwrap()));
+    }
+
+    fn assert_allocation_matches_len(data: Bytes) {
+        let len = data.len();
+        let unique = data.try_into_mut().expect("entry shares its buffer");
+        assert_eq!(unique.capacity(), len);
     }
 
     #[tokio::test]

@@ -604,14 +604,14 @@ impl DbCache for SplitCache {
         match &value.item {
             CachedItem::Block(_) => {
                 if let Some(ref cache) = self.block_cache {
-                    cache.insert(key, value.clamp_allocated_size()).await;
+                    cache.insert(key, value).await;
                 } else {
                     trace!("no block cache available for insertion");
                 }
             }
             CachedItem::SsTableIndex(_) | CachedItem::Filters(_) | CachedItem::SstStats(_) => {
                 if let Some(ref cache) = self.meta_cache {
-                    cache.insert(key, value.clamp_allocated_size()).await;
+                    cache.insert(key, value).await;
                 } else {
                     trace!("no meta cache available for insertion");
                 }
@@ -1298,8 +1298,6 @@ mod tests {
     use crate::format::sst::BlockBuilder;
     use slatedb_common::clock::DefaultSystemClock;
 
-    use crate::flatbuffer_types::test_utils::assert_index_clamped;
-
     #[cfg(feature = "foyer")]
     use super::foyer::FoyerCache;
     #[cfg(feature = "foyer")]
@@ -1649,29 +1647,6 @@ mod tests {
                 )
             );
         }
-    }
-
-    #[rstest]
-    #[tokio::test]
-    async fn test_should_clamp_entries_to_cache(
-        cache: (DbCacheWrapper, Arc<DefaultMetricsRecorder>),
-        sst_format: SsTableFormat,
-        #[future(awt)] sst: EncodedSsTable,
-    ) {
-        let (cache, _registry) = cache;
-        // given:
-        let bytes = sst.remaining_as_bytes();
-        let index = Arc::new(sst_format.read_index_raw(&sst.info, &bytes).await.unwrap());
-        let key = CachedKey::from((SST_ID, 12345u64));
-        cache
-            .insert(key.clone(), CachedEntry::with_sst_index(index.clone()))
-            .await;
-
-        // when:
-        let cached = cache.get_index(&key).await.unwrap().unwrap();
-
-        // then:
-        assert_index_clamped(index.as_ref(), cached.sst_index().unwrap().as_ref());
     }
 
     #[rstest]
